@@ -1,0 +1,194 @@
+import numpy as np
+import sys
+import argparse
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+
+from keras import backend as K
+from keras.preprocessing.image import ImageDataGenerator
+from keras.applications.resnet_v2 import ResNet50V2
+from keras.layers import Dense, GlobalAveragePooling2D, Flatten
+from keras.models import Model, load_model
+from itertools import chain
+
+from Code.ResNet import resnet_def
+
+
+def read_dataset(plot_distribution=True):
+    dataframe = pd.read_csv('Dataset_toy\\Data_Entry_2017.csv')
+    dataframe['Finding Labels'] = dataframe['Finding Labels'].map(lambda x: x.replace('No Finding', ''))
+    label_names = np.unique(list(chain(*dataframe['Finding Labels'].map(lambda x: x.split('|')).tolist())))
+    label_names = [x for x in label_names if len(x) > 0]
+    print('Labels ({}): {}'.format(len(label_names), label_names))
+
+    for label in label_names:
+        if len(label) > 1:
+            dataframe[label] = dataframe['Finding Labels'].map(lambda y: 1.0 if (label in y) else 0.0)
+
+    train_val_list = open('C:\\Users\\javie\\Documents\\Python Scripts\\ChestXray\\Dataset_toy\\train_val_list.txt', 'r').read().splitlines()
+    test_list = open('C:\\Users\\javie\\Documents\\Python Scripts\\ChestXray\\Dataset_toy\\test_list.txt', 'r').read().splitlines()
+
+    train_data = dataframe[dataframe['Image Index'].isin(train_val_list)]
+    test_data = dataframe[dataframe['Image Index'].isin(test_list)]
+
+    print('Train shape: ', train_data.shape, 'Test shape: ', test_data.shape)
+
+    if plot_distribution:
+        fig, ax1 = plt.subplots(figsize=(5, 5))
+        ax1.bar(np.arange(len(label_names)), np.sum(dataframe[label_names].values, axis=0))
+        ax1.set_xticks(np.arange(len(label_names)))
+        ax1.set_xticklabels(label_names, rotation=90)
+        ax1.set_title('Complete dataset')
+
+        fig, ax2 = plt.subplots(figsize=(5, 5))
+        ax2.bar(np.arange(len(label_names)), np.sum(train_data[label_names].values, axis=0))
+        ax2.set_xticks(np.arange(len(label_names)))
+        ax2.set_xticklabels(label_names, rotation=90)
+        ax2.set_title('Train dataset')
+
+        fig, ax3 = plt.subplots(figsize=(5, 5))
+        ax3.bar(np.arange(len(label_names)), np.sum(test_data[label_names].values, axis=0))
+        ax3.set_xticks(np.arange(len(label_names)))
+        ax3.set_xticklabels(label_names, rotation=90)
+        ax3.set_title('Test dataset')
+
+        plt.show()
+    return train_data, test_data, label_names
+
+
+def create_train_generator(dataframe, image_dir, x_column, y_columns, shuffle=True, batch_size=2, seed=42, width=512, height=512):
+    data_generator = ImageDataGenerator(
+        samplewise_center=True,
+        samplewise_std_normalization=True,
+        rotation_range=30, fill_mode='nearest',
+        width_shift_range=0.2, height_shift_range=0.2,
+        horizontal_flip=True)
+    
+    generator = data_generator.flow_from_dataframe(
+        dataframe=dataframe,
+        directory=image_dir,
+        x_col=x_column,
+        y_col=y_columns,
+        class_mode="raw",
+        batch_size=batch_size,
+        shuffle=shuffle,
+        seed=seed,
+        target_size=(width, height))
+
+    return generator
+
+
+def create_val_test_generators(validation_data, test_data, train_data, image_dir, x_column, y_columns, shuffle=True, batch_size=2, seed=42, width=512, height=512):
+    raw_train_gen = ImageDataGenerator().flow_from_dataframe(
+        dataframe=train_data,
+        directory=image_dir,
+        x_col='Image Index',
+        y_col=y_columns,
+        class_mode="raw",
+        batch_size=batch_size,
+        shuffle=shuffle,
+        target_size=(width, height))
+
+    batch_sample = raw_train_gen.next()[0]
+
+    normalized_data_gen = ImageDataGenerator(
+        samplewise_center=True,
+        samplewise_std_normalization=True)
+    normalized_data_gen.fit(batch_sample)
+
+    validation_gen = normalized_data_gen.flow_from_dataframe(
+        dataframe=validation_data,
+        directory=image_dir,
+        x_col=x_column,
+        y_col=y_columns,
+        class_mode="raw",
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed,
+        target_size=(width, height))
+
+    test_gen = normalized_data_gen.flow_from_dataframe(
+        dataframe=test_data,
+        directory=image_dir,
+        x_col=x_column,
+        y_col=y_columns,
+        class_mode="raw",
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed,
+        target_size=(width, height))
+
+    return validation_gen, test_gen
+
+
+def calculate_class_frequencies(label_matrix):
+    num_samples = label_matrix.shape[0]
+    positive_frequencies = (1 / num_samples) * np.sum(label_matrix == 1, axis=0)
+    negative_frequencies = (1 / num_samples) * np.sum(label_matrix == 0, axis=0)
+
+    return positive_frequencies, negative_frequencies
+
+
+def define_weighted_loss(positive_weights, negative_weights, epsilon=1e-7):
+    def loss_function(true_labels, predicted_labels):
+        loss = 0.0
+        for i in range(len(positive_weights)):
+            loss += -1 * K.mean(
+                positive_weights[i] * true_labels[:, i] * K.log(predicted_labels[:, i] + epsilon) +
+                negative_weights[i] * (1 - true_labels[:, i]) * K.log(1 - predicted_labels[:, i] + epsilon))
+        return loss
+    return loss_function
+
+
+def setup_resnet_model(model_instance, label_matrix, optimizer_instance=tf.keras.optimizers.Adam(learning_rate=1e-3)):
+    positive_weights, negative_weights = calculate_class_frequencies(label_matrix)
+    model_instance.compile(optimizer=optimizer_instance, loss=define_weighted_loss(positive_weights, negative_weights),
+                           metrics=[tf.keras.metrics.Accuracy(), tf.keras.metrics.AUC()])
+    return model_instance
+
+
+if __name__ == '__main__':
+    train_data, test_data, label_names = read_dataset(plot_distribution=False)
+    validation_data = test_data[:2000]
+    test_data = test_data[2000:]
+
+    image_directory = '.\\Dataset_toy\\images'
+    train_gen = create_train_generator(train_data, image_directory, 'Image Index', label_names)
+    validation_gen, test_gen = create_val_test_generators(validation_data, test_data, train_data, image_directory, 'Image Index', label_names)
+
+    x_sample, y_sample = train_gen.__getitem__(0)
+
+    is_training = True
+    if is_training:
+        resnet_model = resnet_def(input_shape=x_sample.shape[1:], output_size=train_gen.labels.shape[1])
+        resnet_model = setup_resnet_model(resnet_model, label_matrix=train_gen.labels, optimizer_instance=tf.keras.optimizers.SGD(learning_rate=0.01, momentum=0.9))
+        callbacks_list = [
+            tf.keras.callbacks.EarlyStopping(patience=10),
+            tf.keras.callbacks.ModelCheckpoint(filepath='Models_saves\\ResNet34\\model.{epoch:02d}-{val_loss:.2f}.tf'),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, verbose=1),
+            tf.keras.callbacks.TensorBoard(log_dir="C:\\Users\\javie\\Documents\\Python Scripts\\ChestXray\\Logs\\run9")
+        ]
+
+        with tf.device('/gpu:0'):
+            training_history = resnet_model.fit(train_gen,
+                                                validation_data=validation_gen,
+                                                epochs=15,
+                                                steps_per_epoch=3000,
+                                                callbacks=callbacks_list)
+
+    else:
+        resnet_model = resnet_def(input_shape=x_sample.shape[1:], output_size=train_gen.labels.shape[1])
+        resnet_model = setup_resnet_model(resnet_model, label_matrix=train_gen.labels, optimizer_instance=tf.keras.optimizers.SGD(learning_rate=0.01, momentum=0.9))
+        resnet_model.load_weights('Models_saves\\ResNet34')
+
+    test_results = resnet_model.predict(test_gen, verbose=1)
+    print('Results: shape {}, max {}, min {}'.format(test_results.shape, np.max(test_results), np.min(test_results)))
+
+    differences = test_gen.labels - test_results
+    print('Difference: shape {}, max {}, min {}'.format(differences.shape, np.max(differences), np.min(differences)))
+
+    evaluation_results = resnet_model.evaluate(test_gen, verbose=1)
+    print('Test results: loss = {}, accuracy = {}'.format(evaluation_results[0], evaluation_results[1]))
